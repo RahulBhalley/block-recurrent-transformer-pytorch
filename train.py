@@ -59,20 +59,20 @@ def init_accelerator(device_str: str = None, mixed_precision: str = 'no'):
     if device_str and device_str != 'auto':
         # Manual device override
         if device_str == 'cpu':
-            device_placement_policy = 'cpu'
+            device = 'cpu'
             mixed_precision = 'no'  # Force no mixed precision for CPU
         elif device_str.startswith('cuda'):
-            device_placement_policy = 'cuda'
+            device = 'cuda'
             multi_gpu = torch.cuda.device_count() > 1
         elif device_str == 'mps':
-            device_placement_policy = 'mps'
+            device = 'mps'
             mixed_precision = 'no'  # Force no mixed precision for MPS
             multi_gpu = False
         else:
             raise ValueError(f"Unsupported device: {device_str}")
         
         accelerator = Accelerator(
-            device_placement_policy=device_placement_policy,
+            device=device,
             mixed_precision=mixed_precision,
             split_batches=multi_gpu if 'multi_gpu' in locals() else False,
             gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY
