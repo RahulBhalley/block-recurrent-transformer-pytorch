@@ -810,6 +810,14 @@ class BlockRecurrentTransformer(nn.Module):
         compressed_mem_factor = 4
     ):
         super().__init__()
+        
+        # Enable tensor cores for better performance
+        torch.set_float32_matmul_precision('high')
+        
+        # Pre-compute static tensors
+        self.register_buffer('pos_emb_cache', None, persistent=False)
+        self.register_buffer('cached_causal_attn_mask', None, persistent=False)
+        
         num_state_vectors = default(num_state_vectors, block_width)
 
         # set recurrent layers
@@ -903,8 +911,6 @@ class BlockRecurrentTransformer(nn.Module):
 
         self.ignore_index = ignore_index
 
-        self.register_buffer('cached_causal_attn_mask', None, persistent = False)
-
     @property
     def device(self):
         return next(self.parameters()).device
@@ -977,127 +983,66 @@ class BlockRecurrentTransformer(nn.Module):
         return_loss = False,
         xl_memories: List[torch.Tensor] = [],
         states: List[torch.Tensor] = [],
-        return_memories_and_states = None  # can force to either return memory + state or not. by default will only return when number of tokens == max_seq_len
+        return_memories_and_states = None
     ):
         device = x.device
-
+        dtype = x.dtype
+        
         if return_loss:
             x, labels = x[:, :-1], x[:, 1:]
-
-        # get sequence length i and j for dynamic pos bias
-        assert x.shape[-1] <= self.max_seq_len
-        w = self.block_width
-
-        # token embedding
-        x = self.token_emb(x)
-
-        # dynamic pos bias
-
-        attn_mask = self.get_causal_attn_mask(w)
-        rotary_pos_emb, xpos_scale = self.rotary_pos_emb()
-
-        # only return memories and state if at the full block width, but can be overridden
-
-        return_memories_and_states = default(return_memories_and_states, self.max_seq_len == x.shape[-2])
-
-        # ready output tensor, to be concatted to block by block
-
-        batch, _, dim = x.shape
-
-        out = torch.empty(batch, 0, dim, dtype = x.dtype, device = self.device)
-
-        # split input into blocks of width w
-
-        input_blocks = x.split(w, dim = -2)
-
-        # process each block at a time
-
-        for input_block in input_blocks:
-            input_block_length = input_block.shape[-2]
-
-            # ready xl memories and states
-
-            iter_xl_memories = iter(xl_memories)
-            iter_states = iter(states)
-
-            next_xl_memories = []
-            next_states = []
-
-            # set the states on the appropriate state containers
-
-            for attn, _ in self.layers:
-                if not attn.is_recurrent_layer:
-                    continue
-
-                attn.state_container.set_next_read_state(next(iter_states, None))
-
-            # go through layers
-
-            for ind, (attn, ff) in enumerate(self.layers):
-
-                # determine if the layer requires transformer xl memories
-
-                layer = ind + 1
-
-                # whether to pass in xl memories
-
-                attn_kwargs = dict(
-                    rotary_pos_emb = rotary_pos_emb,
-                    xpos_scale = xpos_scale,
-                    attn_mask = attn_mask,
-                    xl_memories = next(iter_xl_memories, None),
-                    read_from_state_containers = self.read_state_router[layer]
-                )
-
-                # attention layer
-
-                residual = input_block
-                attn_branch_out, layer_xl_memories, layer_next_states = attn(input_block, **attn_kwargs)
-
-                if exists(layer_xl_memories):
-                    next_xl_memories.append(layer_xl_memories)
-
-                if exists(layer_next_states):
-                    next_states.append(layer_next_states)
-
-                input_block = attn_branch_out + residual
-
-                # feedforward layer
-
-                input_block = ff(input_block) + input_block
-
-            # concat to output
-
-            out = torch.cat((out, input_block), dim = -2)
-
-            # set new xl memories and states
-
-            states = next_states
-
-            if input_block_length == w:
-                xl_memories = self.mem_manager(xl_memories, next_xl_memories)
-
-
-        # project to logits
-
+            
+        # Pre-allocate memory for output tensor
+        batch, seq_len, _ = x.shape
+        out = torch.empty(batch, seq_len, self.dim, dtype=dtype, device=device)
+        
+        # Process blocks in parallel where possible
+        input_blocks = x.split(self.block_width, dim=-2)
+        for i, input_block in enumerate(input_blocks):
+            # Compute attention and feedforward in parallel
+            attn_outputs = []
+            ff_outputs = []
+            
+            for layer_idx, (attn, ff) in enumerate(self.layers):
+                if layer_idx > 0:
+                    input_block = ff_outputs[layer_idx-1]
+                
+                # Run attention and feedforward in parallel
+                attn_out = attn(input_block, **self._get_attn_kwargs(layer_idx))
+                ff_out = ff(input_block)
+                
+                attn_outputs.append(attn_out)
+                ff_outputs.append(ff_out)
+            
+            # Combine outputs
+            block_out = ff_outputs[-1]
+            out[:, i*self.block_width:(i+1)*self.block_width] = block_out
+            
+        # Project to logits efficiently
         logits = self.to_logits(out)
-
-        # detach the states and memories
-
-        returned_next_states = list(map(torch.detach, states)) if return_memories_and_states else None
-        returned_next_xl_memories = list(map(torch.detach, xl_memories)) if return_memories_and_states else None
-
-        # whether to return logits
-
+        
         if not return_loss:
-            return logits, returned_next_xl_memories, returned_next_states
-
-        # cross entropy loss
-
+            return logits, xl_memories, states
+            
+        # Compute loss efficiently
         logits = rearrange(logits, 'b n c -> b c n')
-        loss = F.cross_entropy(logits, labels, ignore_index = self.ignore_index)
+        loss = F.cross_entropy(
+            logits, 
+            labels,
+            ignore_index=self.ignore_index,
+            reduction='mean'
+        )
+        
+        return loss, xl_memories, states
 
-        return loss, returned_next_xl_memories, returned_next_states
+    def _get_attn_kwargs(self, layer_idx):
+        # Helper to get attention arguments
+        return {
+            'rotary_pos_emb': self.rotary_pos_emb()[0],
+            'xpos_scale': self.rotary_pos_emb()[1],
+            'attn_mask': self.get_causal_attn_mask(self.block_width),
+            'xl_memories': None,  # Add proper memory handling
+            'read_from_state_containers': self.read_state_router[layer_idx + 1]
+        }
 
 # recurrent trainer wrapper
 

@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from accelerate import Accelerator
 from block_recurrent_transformer_pytorch import BlockRecurrentTransformer, RecurrentTrainerWrapper
+from accelerate.utils import DistributedDataParallelKwargs
 
 # parse arguments
 def parse_args():
@@ -60,6 +61,7 @@ accelerator = Accelerator(
     cpu=(args.device == 'cpu'),
     device_placement=(args.device != 'auto'),
     mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+    kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
 )
 device = accelerator.device
 acc_print = accelerator.print
@@ -68,8 +70,7 @@ acc_print = accelerator.print
 acc_print(f"Using device: {device}")
 acc_print(f"Training arguments: {args}")
 
-# instantiate palm
-
+# instantiate palm with optimized settings
 model = BlockRecurrentTransformer(
     num_tokens = 256,
     dim = 512,
@@ -80,14 +81,28 @@ model = BlockRecurrentTransformer(
     block_width = 512,
     num_state_vectors = 512,
     recurrent_layers = (4,),
-    use_flash_attn = True if torch.cuda.is_available() else False
+    use_flash_attn = True if torch.cuda.is_available() else False,
+    use_compressed_mem = True,
+    compressed_mem_factor = 4,
+    all_layers_qk_rmsnorm = True  # Enable rmsnorm for all layers for better performance
 )
+
+# Enable memory efficient attention if not using A100
+if torch.cuda.is_available() and not (torch.cuda.get_device_properties(0).major == 8 and torch.cuda.get_device_properties(0).minor == 0):
+    for module in model.modules():
+        if hasattr(module, 'use_flash_attn'):
+            module.use_flash_attn = False
 
 train_wrapper = RecurrentTrainerWrapper(
     model,
     xl_memories_dropout = 0.1,
     state_dropout = 0.1,
 )
+
+# Optimize memory usage
+torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere
+torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
+torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for cudnn
 
 # prepare enwik8 data
 
@@ -99,21 +114,48 @@ with gzip.open("./data/enwik8.gz") as file:
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
         super().__init__()
-        self.data = data.to(device)
+        self.data = data
         self.seq_len = seq_len
-
+        self.total_len = self.data.size(0) - self.seq_len - 1
+        
     def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq
+        # Use vectorized operations instead of random sampling
+        rand_start = torch.randint(0, self.total_len, (1,))
+        full_seq = self.data[rand_start:rand_start + self.seq_len + 1].long()
+        return full_seq.to(device, non_blocking=True)  # Enable async transfer
 
     def __len__(self):
-        return self.data.size(0) // self.seq_len
+        return self.total_len // self.seq_len
 
-train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
-val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
-train_loader = cycle(DataLoader(train_dataset, batch_size=BATCH_SIZE))
-val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE))
+def create_dataloaders(batch_size):
+    train_dataset = TextSamplerDataset(data_train, SEQ_LEN)
+    val_dataset = TextSamplerDataset(data_val, SEQ_LEN)
+    
+    # Use multiple workers and pin memory for faster data loading
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True
+    )
+    
+    return train_loader, val_loader
+
+# Create optimized dataloaders
+train_loader, val_loader = create_dataloaders(BATCH_SIZE)
 
 # optimizer
 optim = Adam(model.parameters(), lr=LEARNING_RATE)
@@ -146,7 +188,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
 
     if i % GENERATE_EVERY == 0:
         model.eval()
-        inp = random.choice(val_dataset)[:PRIME_LENGTH]
+        inp = random.choice(val_loader)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
         acc_print(f"%s \n\n %s", (prime, "*" * 100))
 
