@@ -165,14 +165,17 @@ model, train_wrapper, optim, train_loader, val_loader = accelerator.prepare(
     model, train_wrapper, optim, train_loader, val_loader
 )
 
-# training
+# Create cyclic iterators for the dataloaders
+train_iter = cycle(train_loader)
+val_iter = cycle(val_loader)
 
+# training
 pbar = tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training")
 for i in pbar:
     model.train()
 
     for _ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = train_wrapper(next(train_loader))
+        loss = train_wrapper(next(train_iter))
         accelerator.backward(loss / GRADIENT_ACCUMULATE_EVERY)
 
     metrics = {'train_loss': f"{loss.item():.4f}"}
@@ -180,7 +183,7 @@ for i in pbar:
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            val_loss = train_wrapper(next(val_loader))
+            val_loss = train_wrapper(next(val_iter))
             metrics['val_loss'] = f"{val_loss.item():.4f}"
 
     pbar.set_postfix(**metrics)
@@ -191,7 +194,7 @@ for i in pbar:
 
     if i % GENERATE_EVERY == 0:
         model.eval()
-        inp = random.choice(val_loader)[:PRIME_LENGTH]
+        inp = next(val_iter)[:PRIME_LENGTH]  # Use val_iter instead of random.choice
         prime = decode_tokens(inp)
         acc_print(f"%s \n\n %s", (prime, "*" * 100))
 
