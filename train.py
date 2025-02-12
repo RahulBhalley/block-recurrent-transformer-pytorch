@@ -15,7 +15,7 @@ from block_recurrent_transformer_pytorch import BlockRecurrentTransformer, Recur
 # parse arguments
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Block Recurrent Transformer')
-    parser.add_argument('--device', type=str, default='auto', 
+    parser.add_argument('--device', type=str, default='auto',
                       choices=['cpu', 'cuda', 'mps', 'auto'],
                       help='Device to use (auto, cpu, cuda, or mps)')
     parser.add_argument('--batch_size', type=int, default=4,
@@ -54,45 +54,17 @@ def decode_token(token):
 def decode_tokens(tokens):
     return "".join(list(map(decode_token, tokens)))
 
-def init_accelerator(device_str: str = None, mixed_precision: str = 'no'):
-    """Initialize accelerator with optional device override and mixed precision"""
-    if device_str and device_str != 'auto':
-        # Manual device override
-        if device_str == 'cpu':
-            device = 'cpu'
-            mixed_precision = 'no'  # Force no mixed precision for CPU
-        elif device_str.startswith('cuda'):
-            device = 'cuda'
-            multi_gpu = torch.cuda.device_count() > 1
-        elif device_str == 'mps':
-            device = 'mps'
-            mixed_precision = 'no'  # Force no mixed precision for MPS
-            multi_gpu = False
-        else:
-            raise ValueError(f"Unsupported device: {device_str}")
-        
-        accelerator = Accelerator(
-            device=device,
-            mixed_precision=mixed_precision,
-            split_batches=multi_gpu if 'multi_gpu' in locals() else False,
-            gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY
-        )
-    else:
-        # Let Accelerate automatically choose the best device
-        multi_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 1
-        accelerator = Accelerator(
-            mixed_precision=mixed_precision,
-            split_batches=multi_gpu,
-            gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY
-        )
-    
-    return accelerator, accelerator.device
-
-# accelerator
-accelerator, device = init_accelerator(args.device)
+# Initialize accelerator with device preference
+accelerator = Accelerator(
+    gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY,
+    cpu=(args.device == 'cpu'),
+    device_placement=(args.device != 'auto'),
+    mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+)
+device = accelerator.device
 acc_print = accelerator.print
 
-# Print device information and arguments
+# Print device information
 acc_print(f"Using device: {device}")
 acc_print(f"Training arguments: {args}")
 
@@ -108,7 +80,7 @@ model = BlockRecurrentTransformer(
     block_width = 512,
     num_state_vectors = 512,
     recurrent_layers = (4,),
-    use_flash_attn = True
+    use_flash_attn = True if torch.cuda.is_available() else False
 )
 
 train_wrapper = RecurrentTrainerWrapper(
@@ -127,7 +99,7 @@ with gzip.open("./data/enwik8.gz") as file:
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
         super().__init__()
-        self.data = data
+        self.data = data.to(device)
         self.seq_len = seq_len
 
     def __getitem__(self, index):

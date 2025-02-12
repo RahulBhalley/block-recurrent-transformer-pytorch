@@ -988,20 +988,8 @@ class BlockRecurrentTransformer(nn.Module):
         assert x.shape[-1] <= self.max_seq_len
         w = self.block_width
 
-        # token embedding with MPS fallback
-        # Move embedding to CPU for MPS devices to avoid known issues
-        # Reference: https://github.com/pytorch/pytorch/issues/102911
-        if device.type == 'mps':
-            # Store original device
-            orig_emb_device = self.token_emb.weight.device
-            # Temporarily move to CPU
-            self.token_emb = self.token_emb.cpu()
-            x_cpu = x.cpu()
-            x = self.token_emb(x_cpu).to(device)
-            # Move back to original device
-            self.token_emb = self.token_emb.to(orig_emb_device)
-        else:
-            x = self.token_emb(x)
+        # token embedding
+        x = self.token_emb(x)
 
         # dynamic pos bias
 
