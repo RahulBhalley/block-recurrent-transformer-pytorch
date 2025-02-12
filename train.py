@@ -3,6 +3,7 @@ import random
 import tqdm
 import numpy as np
 import argparse
+import torch.multiprocessing as mp
 
 import torch
 from torch.optim import Adam
@@ -12,6 +13,10 @@ from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 from block_recurrent_transformer_pytorch import BlockRecurrentTransformer, RecurrentTrainerWrapper
 from accelerate.utils import DistributedDataParallelKwargs
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
 
 # parse arguments
 def parse_args():
@@ -122,7 +127,7 @@ class TextSamplerDataset(Dataset):
         # Use vectorized operations instead of random sampling
         rand_start = torch.randint(0, self.total_len, (1,))
         full_seq = self.data[rand_start:rand_start + self.seq_len + 1].long()
-        return full_seq.to(device, non_blocking=True)  # Enable async transfer
+        return full_seq  # Remove device transfer from dataset
 
     def __len__(self):
         return self.total_len // self.seq_len
@@ -136,20 +141,20 @@ def create_dataloaders(batch_size):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=4 if torch.cuda.is_available() else 0,  # Only use workers if CUDA is available
+        pin_memory=torch.cuda.is_available(),  # Only pin memory if CUDA is available
         drop_last=True,
-        persistent_workers=True
+        persistent_workers=True if torch.cuda.is_available() else False  # Only use persistent workers if CUDA is available
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=4 if torch.cuda.is_available() else 0,
+        pin_memory=torch.cuda.is_available(),
         drop_last=True,
-        persistent_workers=True
+        persistent_workers=True if torch.cuda.is_available() else False
     )
     
     return train_loader, val_loader
@@ -203,3 +208,31 @@ for i in pbar:
         sample = train_wrapper.generate(inp, length=GENERATE_LENGTH)
         output_str = decode_tokens(accelerator.gather(sample)[0])
         acc_print(output_str, "\n")
+
+# Wrap the main training code in if __name__ == '__main__':
+if __name__ == '__main__':
+    args = parse_args()
+
+    # constants
+    NUM_BATCHES = args.num_batches
+    BATCH_SIZE = args.batch_size
+    GRADIENT_ACCUMULATE_EVERY = args.gradient_accumulate_every
+    LEARNING_RATE = args.learning_rate
+    VALIDATE_EVERY = 100
+    PRIME_LENGTH = 128
+    GENERATE_EVERY = 250
+    GENERATE_LENGTH = 2048
+    SEQ_LEN = 2048
+
+    # Initialize accelerator with device preference
+    accelerator = Accelerator(
+        gradient_accumulation_steps=GRADIENT_ACCUMULATE_EVERY,
+        cpu=(args.device == 'cpu'),
+        device_placement=(args.device != 'auto'),
+        mixed_precision='fp16' if torch.cuda.is_available() else 'no',
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False)],
+    )
+    device = accelerator.device
+    acc_print = accelerator.print
+
+    # Rest of your existing code...
