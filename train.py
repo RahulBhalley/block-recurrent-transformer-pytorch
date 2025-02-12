@@ -99,7 +99,7 @@ def main():
     PRIME_LENGTH = 128
     GENERATE_EVERY = 250
     GENERATE_LENGTH = 2048
-    SEQ_LEN = 2048
+    SEQ_LEN = 1024  # Match this with model's max_seq_len
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -129,8 +129,8 @@ def main():
         depth = 6,
         dim_head = 64,
         heads = 8,
-        max_seq_len = 1024,
-        block_width = 512,
+        max_seq_len = SEQ_LEN,
+        block_width = SEQ_LEN // 2,  # Set block width to half of sequence length
         num_state_vectors = 512,
         recurrent_layers = (4,),
         use_flash_attn = True if torch.cuda.is_available() else False,
@@ -178,7 +178,8 @@ def main():
         model.train()
 
         for _ in range(GRADIENT_ACCUMULATE_EVERY):
-            loss = train_wrapper(next(train_iter))
+            batch = next(train_iter)
+            loss = train_wrapper(batch)
             accelerator.backward(loss / GRADIENT_ACCUMULATE_EVERY)
 
         metrics = {'train_loss': f"{loss.item():.4f}"}
@@ -186,7 +187,8 @@ def main():
         if i % VALIDATE_EVERY == 0:
             model.eval()
             with torch.no_grad():
-                val_loss = train_wrapper(next(val_iter))
+                val_batch = next(val_iter)
+                val_loss = train_wrapper(val_batch)
                 metrics['val_loss'] = f"{val_loss.item():.4f}"
 
         pbar.set_postfix(**metrics)
@@ -197,11 +199,10 @@ def main():
 
         if i % GENERATE_EVERY == 0:
             model.eval()
-            inp = next(val_iter)[:PRIME_LENGTH]
-            prime = decode_tokens(inp)
+            inp = next(val_iter)[:, :PRIME_LENGTH]  # Get first PRIME_LENGTH tokens
+            prime = decode_tokens(inp[0])  # Decode first sequence in batch
             acc_print(f"%s \n\n %s", (prime, "*" * 100))
 
-            inp = accelerator.prepare(inp[None, ...])
             sample = train_wrapper.generate(inp, length=GENERATE_LENGTH)
             output_str = decode_tokens(accelerator.gather(sample)[0])
             acc_print(output_str, "\n")
