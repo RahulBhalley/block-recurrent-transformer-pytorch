@@ -167,24 +167,27 @@ model, train_wrapper, optim, train_loader, val_loader = accelerator.prepare(
 
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
+pbar = tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training")
+for i in pbar:
     model.train()
 
     for _ in range(GRADIENT_ACCUMULATE_EVERY):
         loss = train_wrapper(next(train_loader))
         accelerator.backward(loss / GRADIENT_ACCUMULATE_EVERY)
 
-    acc_print(f"training loss: {loss.item()}")
-    accelerator.clip_grad_norm_(model.parameters(), 0.5)
-
-    optim.step()
-    optim.zero_grad()
+    metrics = {'train_loss': f"{loss.item():.4f}"}
 
     if i % VALIDATE_EVERY == 0:
         model.eval()
         with torch.no_grad():
-            loss = train_wrapper(next(val_loader))
-            acc_print(f"validation loss: {loss.item()}")
+            val_loss = train_wrapper(next(val_loader))
+            metrics['val_loss'] = f"{val_loss.item():.4f}"
+
+    pbar.set_postfix(**metrics)
+    accelerator.clip_grad_norm_(model.parameters(), 0.5)
+
+    optim.step()
+    optim.zero_grad()
 
     if i % GENERATE_EVERY == 0:
         model.eval()
